@@ -1,0 +1,43 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CARLA_VERSION=0.9.15
+ENV HOME=/home/carla
+
+# 1. Install all dependencies in a single layer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvulkan1 \
+    mesa-vulkan-drivers \
+    libgl1-mesa-dri \
+    libegl-mesa0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libxrandr2 \
+    libx11-xcb1 \
+    libfontconfig1 \
+    python3 \
+    python3-pip \
+    ca-certificates \
+    wget \
+    vulkan-tools \
+    xdg-user-dirs \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Download CARLA
+RUN mkdir -p /opt/carla && \
+    wget -qO- https://carla-releases.s3.us-east-005.backblazeb2.com/Linux/CARLA_${CARLA_VERSION}.tar.gz | \
+    tar xz -C /opt/carla
+
+# 3. Create non-root user and assign ownership
+RUN groupadd -g 1001 carla && \
+    useradd -m -u 1001 -g carla -s /bin/bash carla && \
+    chown -R carla:carla /opt/carla /home/carla
+
+# 4. Switch to non-root user and initialize xdg
+USER carla
+RUN mkdir -p /home/carla/.config && xdg-user-dirs-update
+
+WORKDIR /opt/carla
+
+ENTRYPOINT ["./CarlaUE4.sh", "-RenderOffScreen", "-vulkan", "-nosound"]

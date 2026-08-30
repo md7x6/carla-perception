@@ -1,0 +1,5 @@
+simulation:
+  host: localhost
+  port: 2000
+  town: Town05
+  fixed_delta_seconds: 0.05

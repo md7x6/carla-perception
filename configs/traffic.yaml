@@ -1,0 +1,5 @@
+traffic:
+  num_vehicles: 50
+  num_pedestrians: 100
+  speed_diff_percent: 30.0
+  distance_to_leading_vehicle: 5.0
