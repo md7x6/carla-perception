@@ -1,3 +1,4 @@
+import os
 import cv2
 import random
 import time
@@ -12,14 +13,78 @@ from perception.simulation.traffic import spawn_random_traffic
 from perception.simulation.traffic import spawn_pedestrians
 from perception.sensors.camera import spawn_camera, FrameBuffer
 from perception.sensors.depth_camera import DepthFrameBuffer, spawn_depth_camera
+from perception.sensors.lidar import LiDARFrameBuffer, spawn_lidar
 
 from perception.ground_truth.actors import get_target_actors, get_actor_class
 from perception.ground_truth.projection import build_camera_matrix, project_bbox, bbox_2d_from_points
 from perception.ground_truth.visibility import is_bbox_visible
 
 from perception.ground_truth.visualization import draw_bbox
-#from save_dataset import save_dataset
 
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
+
+class CameraPublisher(Node):
+
+    def __init__(self):
+        super().__init__("carla_camera_publisher")
+
+        self.publisher = self.create_publisher(
+            Image,
+            "/camera/image_raw",
+            10
+        )
+
+    def publish_frame(self, frame):
+
+        msg = Image()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "camera"
+
+        msg.height = frame.shape[0]
+        msg.width = frame.shape[1]
+
+        msg.encoding = "bgr8"
+        msg.is_bigendian = False
+        msg.step = frame.strides[0]
+        msg.data = frame.tobytes()
+
+        self.publisher.publish(msg)
+
+class LiDARPublisher(Node):
+
+    def __init__(self):
+        super().__init__("carla_lidar_publisher")
+
+        self.publisher = self.create_publisher(
+            PointCloud2,
+            "/lidar/points",
+            10
+        )
+
+    def publish_points(self, points, frame_id="lidar"):
+        if points is None or len(points) == 0:
+            return
+
+        msg = point_cloud2.create_cloud_xyz32(
+            self._create_header(frame_id),
+            points[:, :3]
+        )
+
+        self.publisher.publish(msg)
+
+    def _create_header(self, frame_id):
+        from std_msgs.msg import Header
+
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = frame_id
+
+        return header
 
 def wait_for_synced_frame(world, frame_buffer, depth_buffer, max_ticks=10, timeout=1.0):
     """
@@ -61,9 +126,13 @@ def run_perception_loop(
     ego_vehicle,
     camera,
     depth_camera,
+    lidar,
     frame_buffer,
     depth_buffer,
+    lidar_buffer,
     K,
+    camera_publisher,
+    lidar_publisher,
     window_name="Carla Perception",
 ):
     width, height = camera_settings_wh(camera)
@@ -78,9 +147,25 @@ def run_perception_loop(
         rgb = frame_buffer.latest_frame
         depth = depth_buffer.latest_depth
 
+        points = lidar_buffer.latest_points
+        lidar_frame = lidar_buffer.latest_frame_id
+
+        lidar_publisher.publish_points(
+            points,
+            frame_id="lidar"
+        )
+
+        print(
+            f"RGB={current_frame} "
+            f"Depth={depth_buffer.latest_frame_id} "
+            f"LiDAR={lidar_frame} "
+            f"points={0 if points is None else len(points)}"
+        )
+
         if rgb is None or depth is None:
             continue
 
+        camera_publisher.publish_frame(rgb)
         annotated = rgb.copy()
 
         for actor in get_target_actors(world):
@@ -111,9 +196,6 @@ def run_perception_loop(
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
-
-import os
-
 
 def save_dataset(
     world,
@@ -247,6 +329,7 @@ def cleanup(
     world,
     camera,
     depth_camera,
+    lidar,
     ego_vehicle,
     vehicles,
     controllers,
@@ -266,6 +349,14 @@ def cleanup(
         for _ in range(3):
             world.tick()
         depth_camera.destroy()
+
+    if lidar is not None and lidar.is_alive:
+        lidar.stop()
+
+        for _ in range(3):
+            world.tick()
+
+        lidar.destroy()
 
     for controller in controllers:
         if controller.is_alive:
@@ -295,25 +386,27 @@ def cleanup(
 
 
 def main():
+    rclpy.init()
+    camera_publisher = CameraPublisher()
+    lidar_publisher = LiDARPublisher()
+
     camera = None
     depth_camera = None
+    lidar = None 
     ego_vehicle = None
 
     vehicles = []
     controllers = []
     walkers = []
 
-    simulation_config = load_config("../configs/simulation.yaml")
+    simulation_config = load_config("../configs/settings.yaml")
     simulation = simulation_config["simulation"]
-
-    traffic_config = load_config("../configs/traffic.yaml")
-    traffic = traffic_config["traffic"]
-
-    camera_config = load_config("../configs/camera.yaml")
-    camera_settings = camera_config["camera"]
+    environment = simulation_config["environment"]
+    traffic = simulation_config["traffic"]
+    camera_settings = simulation_config["camera"]
 
     client, world = connect(
-        simulation["host"], simulation["port"], simulation["town"]
+        simulation["host"], simulation["port"], environment["town"]
     )
 
     blueprints = world.get_blueprint_library()
@@ -346,19 +439,45 @@ def main():
         # must be server-resolved before .start()/.go_to_location() work.
         world.tick()
 
-        for controller in controllers:
+        active_walkers = []
+        active_controllers = []
+
+        for walker, controller in zip(walkers, controllers):
             if not controller.is_alive:
+                if walker.is_alive:
+                    walker.destroy()
                 continue
+
             try:
                 controller.start()
+
                 destination = world.get_random_location_from_navigation()
                 if destination is not None:
                     controller.go_to_location(destination)
-                controller.set_max_speed(1.4 + random.uniform(-0.3, 0.3))
-            except RuntimeError as e:
-                print(f"Failed to start controller {controller.id}: {e}")
 
-        print(f"Spawned {len(walkers)} pedestrians")
+                controller.set_max_speed(
+                    1.4 + random.uniform(-0.3, 0.3)
+                )
+
+                active_walkers.append(walker)
+                active_controllers.append(controller)
+
+            except RuntimeError as e:
+                print(
+                    f"Failed to start controller {controller.id} "
+                    f"for walker {walker.id}: {e}"
+                )
+
+                if controller.is_alive:
+                    controller.destroy()
+
+                if walker.is_alive:
+                    walker.destroy()
+
+        walkers = active_walkers
+        controllers = active_controllers
+
+        print(f"Active pedestrians: {len(walkers)}")
 
         # Single source of truth for the relative sensor transform.
         # RGB and depth cameras MUST share this exact object — passing
@@ -379,38 +498,49 @@ def main():
             transform=camera_transform
         )
 
+        lidar = spawn_lidar(
+            world,
+            blueprints,
+            ego_vehicle,
+            transform=camera_transform
+        )
+
         K = build_camera_matrix(
             camera_settings["width"], camera_settings["height"], camera_settings["fov"]
         )
 
         frame_buffer = FrameBuffer()
         depth_buffer = DepthFrameBuffer()
+        lidar_buffer = LiDARFrameBuffer()
 
         camera.listen(frame_buffer.on_image)
         depth_camera.listen(depth_buffer.on_image)
+        lidar.listen(lidar_buffer.on_lidar)
 
         synced_frame = wait_for_synced_frame(world, frame_buffer, depth_buffer)
         print(f"Initial sync at frame: {synced_frame}")
 
-        """
         run_perception_loop(
-            world, ego_vehicle, camera, depth_camera,
-            frame_buffer, depth_buffer, K
-        )"""
-
+            world, ego_vehicle, camera, lidar, depth_camera,
+            frame_buffer, depth_buffer, lidar_buffer, K, camera_publisher, lidar_publisher
+        )
+        """
         save_dataset(
             world, ego_vehicle, camera, depth_camera,
             frame_buffer, depth_buffer, K,
-            output_dir="../data/raw/continuous_v1",
+            output_dir="../data/raw/continuous_v3",
             num_images=2000,
             save_interval=20,
         )
-
+        """
     finally:
         cleanup(
-            world, camera, depth_camera, ego_vehicle,
+            world, camera, depth_camera, lidar, ego_vehicle,
             vehicles, controllers, walkers, traffic_manager
         )
+        lidar_publisher.destroy_node()
+        camera_publisher.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

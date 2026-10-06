@@ -1,7 +1,6 @@
 import carla
 import numpy as np
 
-
 class DepthFrameBuffer:
     """Holds the most recent CARLA depth frame."""
 
@@ -28,13 +27,13 @@ class DepthFrameBuffer:
 
         self.latest_depth = depth
         self.latest_frame_id = image.frame
-
+        """
         print(
             f"Depth frame={image.frame}, "
             f"min={depth.min():.2f}, "
             f"max={depth.max():.2f}, "
             f"center={depth[image.height // 2, image.width // 2]:.2f}"
-        )
+        )"""
 
     def get_depth_at_pixel(self, depth_image, x, y):
         return depth_image[y, x]

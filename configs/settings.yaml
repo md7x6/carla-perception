@@ -1,0 +1,35 @@
+simulation:
+  Name: Normal Urban Driving
+  host: localhost
+  port: 2000
+  fixed_delta_seconds: 0.05
+
+environment:
+  town: Town05
+  weather:
+    preset: ClearNoon
+
+camera:
+  width: 1280
+  height: 720
+  fov: 90
+
+  location:
+    x: 1.5
+    y: 0
+    z: 2.4
+  
+  rotation:
+    pitch: 0.0
+    yaw: 0.0
+    roll: 0.0
+
+traffic:
+  num_vehicles: 20
+  num_pedestrians: 400
+  speed_diff_percent: 30.0
+  distance_to_leading_vehicle: 5.0
+
+capture:
+  output_dir: "data/raw/continuous_v3"
+  max_frames: 2000
