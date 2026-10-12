@@ -6,6 +6,7 @@ import numpy as np
 import carla
 
 from perception.utils.config import load_config
+from perception.utils.timestamps import carla_time_to_ros
 from perception.simulation.connection import connect
 from perception.simulation.traffic import setup_traffic_manager
 from perception.simulation.ego import spawn_ego_vehicle
@@ -14,6 +15,7 @@ from perception.simulation.traffic import spawn_pedestrians
 from perception.sensors.camera import spawn_camera, FrameBuffer
 from perception.sensors.depth_camera import DepthFrameBuffer, spawn_depth_camera
 from perception.sensors.lidar import LiDARFrameBuffer, spawn_lidar
+from perception.sensors.imu import IMUFrameBuffer, spawn_imu
 
 from perception.ground_truth.actors import get_target_actors, get_actor_class
 from perception.ground_truth.projection import build_camera_matrix, project_bbox, bbox_2d_from_points
@@ -27,6 +29,8 @@ from sensor_msgs.msg import Image
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 
+from sensor_msgs.msg import Imu
+
 class CameraPublisher(Node):
 
     def __init__(self):
@@ -38,11 +42,11 @@ class CameraPublisher(Node):
             10
         )
 
-    def publish_frame(self, frame):
+    def publish_frame(self, frame, stamp):
 
         msg = Image()
 
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = stamp
         msg.header.frame_id = "camera"
 
         msg.height = frame.shape[0]
@@ -66,52 +70,110 @@ class LiDARPublisher(Node):
             10
         )
 
-    def publish_points(self, points, frame_id="lidar"):
+    def publish_points(self, points, stamp, frame_id="lidar"):
+
         if points is None or len(points) == 0:
             return
 
         msg = point_cloud2.create_cloud_xyz32(
-            self._create_header(frame_id),
+            self._create_header(stamp, frame_id),
             points[:, :3]
         )
 
         self.publisher.publish(msg)
 
-    def _create_header(self, frame_id):
+    def _create_header(self, stamp, frame_id):
         from std_msgs.msg import Header
 
         header = Header()
-        header.stamp = self.get_clock().now().to_msg()
+        header.stamp = stamp
         header.frame_id = frame_id
 
         return header
 
-def wait_for_synced_frame(world, frame_buffer, depth_buffer, max_ticks=10, timeout=1.0):
-    """
-    Tick until both RGB and depth buffers have delivered a frame
-    matching the current simulation frame.
 
-    Sensor callbacks are asynchronous relative to tick() — a single
-    tick() does not guarantee fresh, matched data has arrived yet.
-    Confirmed necessary: without this, frame_buffer/depth_buffer
-    were observed to still be None immediately after tick().
+class IMUPublisher(Node):
+
+    def __init__(self):
+        super().__init__("carla_imu_publisher")
+
+        self.publisher = self.create_publisher(
+            Imu,
+            "/imu/data",
+            10
+        )
+
+    def publish_imu(self, stamp, accelerometer, gyroscope):
+
+        if accelerometer is None or gyroscope is None:
+            return
+
+        msg = Imu()
+
+        msg.header.stamp = stamp
+        msg.header.frame_id = "imu"
+
+        # CARLA uses left-handed coordinates.
+        # Convert to ROS FLU (x forward, y left, z up).
+        msg.linear_acceleration.x = float(accelerometer[0])
+        msg.linear_acceleration.y = -float(accelerometer[1])
+        msg.linear_acceleration.z = float(accelerometer[2])
+
+        msg.angular_velocity.x = -float(gyroscope[0])
+        msg.angular_velocity.y = float(gyroscope[1])
+        msg.angular_velocity.z = -float(gyroscope[2])
+
+        # Orientation is not estimated here.
+        msg.orientation_covariance[0] = -1.0
+
+        self.publisher.publish(msg)
+
+
+
+def wait_for_synced_frame(
+    world,
+    frame_buffer,
+    depth_buffer,
+    lidar_buffer,
+    imu_buffer,
+    max_ticks=20,
+    timeout=1.0
+):
     """
+    Wait until RGB, depth, LiDAR and IMU measurements
+    belong to the same CARLA simulation frame.
+    """
+
     for _ in range(max_ticks):
-        world.tick()
-        current_frame = world.get_snapshot().frame
 
-        deadline = time.time() + timeout
-        while (frame_buffer.latest_frame_id != current_frame
-               or depth_buffer.latest_frame_id != current_frame):
-            if time.time() > deadline:
-                break
+        current_frame = world.tick()
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+
+            rgb_ready = (
+                frame_buffer.latest_frame_id == current_frame
+            )
+            depth_ready = (
+                depth_buffer.latest_frame_id == current_frame
+            )
+            lidar_ready = (
+                lidar_buffer.latest_frame_id == current_frame
+            )
+            imu_ready = (
+                imu_buffer.latest_frame_id == current_frame
+            )
+
+            if all([
+                rgb_ready,
+                depth_ready,
+                lidar_ready,
+                imu_ready
+            ]):
+                return current_frame
             time.sleep(0.005)
-
-        if (frame_buffer.latest_frame_id == current_frame
-                and depth_buffer.latest_frame_id == current_frame):
-            return current_frame
-
     return None
+
 
 
 def camera_settings_wh(camera):
@@ -130,19 +192,31 @@ def run_perception_loop(
     frame_buffer,
     depth_buffer,
     lidar_buffer,
+    imu_buffer,
     K,
     camera_publisher,
     lidar_publisher,
+    imu_publisher,
     window_name="Carla Perception",
 ):
     width, height = camera_settings_wh(camera)
 
     while True:
-        current_frame = wait_for_synced_frame(world, frame_buffer, depth_buffer)
+        current_frame = wait_for_synced_frame(world, frame_buffer, depth_buffer, lidar_buffer, imu_buffer)
 
         if current_frame is None:
             print("WARNING: RGB/depth did not sync this step, skipping frame.")
             continue
+
+        snapshot = world.get_snapshot()
+        
+        if snapshot.frame != current_frame:
+            print("WARNING: Snapshot frame mismatch")
+            continue
+        
+        stamp = carla_time_to_ros(
+            snapshot.timestamp.elapsed_seconds
+        )
 
         rgb = frame_buffer.latest_frame
         depth = depth_buffer.latest_depth
@@ -152,7 +226,17 @@ def run_perception_loop(
 
         lidar_publisher.publish_points(
             points,
+            stamp,
             frame_id="lidar"
+        )
+
+        accelerometer = imu_buffer.latest_accelerometer
+        gyroscope = imu_buffer.latest_gyroscope
+
+        imu_publisher.publish_imu(
+            stamp,
+            accelerometer,
+            gyroscope
         )
 
         print(
@@ -160,12 +244,15 @@ def run_perception_loop(
             f"Depth={depth_buffer.latest_frame_id} "
             f"LiDAR={lidar_frame} "
             f"points={0 if points is None else len(points)}"
+            f"IMU frame={imu_buffer.latest_frame_id} "
+            f"acc={accelerometer} "
+            f"gyro={gyroscope}"
         )
 
         if rgb is None or depth is None:
             continue
 
-        camera_publisher.publish_frame(rgb)
+        camera_publisher.publish_frame(rgb, stamp)
         annotated = rgb.copy()
 
         for actor in get_target_actors(world):
@@ -204,6 +291,8 @@ def save_dataset(
     depth_camera,
     frame_buffer,
     depth_buffer,
+    lidar_buffer, 
+    imu_buffer,
     K,
     output_dir,
     num_images=5,
@@ -240,7 +329,7 @@ def save_dataset(
     attempted_frames = 0
 
     while saved_count < num_images:
-        current_frame = wait_for_synced_frame(world, frame_buffer, depth_buffer)
+        current_frame = wait_for_synced_frame(world, frame_buffer, depth_buffer, lidar_buffer, imu_buffer)
 
         if current_frame is None:
             print("WARNING: RGB/depth did not sync this step, skipping.")
@@ -330,6 +419,7 @@ def cleanup(
     camera,
     depth_camera,
     lidar,
+    imu,
     ego_vehicle,
     vehicles,
     controllers,
@@ -357,6 +447,10 @@ def cleanup(
             world.tick()
 
         lidar.destroy()
+
+    if imu is not None and imu.is_alive:
+        imu.stop()
+        imu.destroy()
 
     for controller in controllers:
         if controller.is_alive:
@@ -389,11 +483,13 @@ def main():
     rclpy.init()
     camera_publisher = CameraPublisher()
     lidar_publisher = LiDARPublisher()
+    imu_publisher = IMUPublisher()
 
     camera = None
     depth_camera = None
     lidar = None 
     ego_vehicle = None
+    imu = None
 
     vehicles = []
     controllers = []
@@ -505,6 +601,13 @@ def main():
             transform=camera_transform
         )
 
+        imu = spawn_imu(
+            world,
+            blueprints,
+            ego_vehicle,
+            transform=camera_transform
+        )
+
         K = build_camera_matrix(
             camera_settings["width"], camera_settings["height"], camera_settings["fov"]
         )
@@ -512,17 +615,23 @@ def main():
         frame_buffer = FrameBuffer()
         depth_buffer = DepthFrameBuffer()
         lidar_buffer = LiDARFrameBuffer()
+        imu_buffer = IMUFrameBuffer()
 
         camera.listen(frame_buffer.on_image)
         depth_camera.listen(depth_buffer.on_image)
         lidar.listen(lidar_buffer.on_lidar)
+        imu.listen(imu_buffer.on_imu)
 
-        synced_frame = wait_for_synced_frame(world, frame_buffer, depth_buffer)
+        synced_frame = wait_for_synced_frame(world, frame_buffer, depth_buffer, lidar_buffer, imu_buffer)
+
+        if synced_frame is None:
+            raise RuntimeError("Initial sensor synchronization failed")
+        
         print(f"Initial sync at frame: {synced_frame}")
 
         run_perception_loop(
-            world, ego_vehicle, camera, lidar, depth_camera,
-            frame_buffer, depth_buffer, lidar_buffer, K, camera_publisher, lidar_publisher
+            world, ego_vehicle, camera, depth_camera, lidar,
+            frame_buffer, depth_buffer, lidar_buffer, imu_buffer, K, camera_publisher, lidar_publisher, imu_publisher
         )
         """
         save_dataset(
@@ -535,9 +644,10 @@ def main():
         """
     finally:
         cleanup(
-            world, camera, depth_camera, lidar, ego_vehicle,
+            world, camera, depth_camera, lidar, imu, ego_vehicle,
             vehicles, controllers, walkers, traffic_manager
         )
+        imu_publisher.destroy_node()
         lidar_publisher.destroy_node()
         camera_publisher.destroy_node()
         rclpy.shutdown()
